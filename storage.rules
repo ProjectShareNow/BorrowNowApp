@@ -1,0 +1,55 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+
+    // Helper functions
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isImageBelow5MB() {
+      return request.resource == null || (
+        request.resource.size < 5 * 1024 * 1024 &&
+        request.resource.contentType.matches('image/.*')
+      );
+    }
+
+    // 1. College ID Cards: Strictly private (student upload, authenticated preview/admin review)
+    match /id_cards/{userId}/{allPaths=**} {
+      allow write: if isAuthenticated() && request.auth.uid == userId && isImageBelow5MB();
+      allow read: if isAuthenticated();
+    }
+
+    // 2. Item Photos: Publicly visible to authenticated campus students
+    match /item_images/{allPaths=**} {
+      allow read: if isAuthenticated();
+      allow write: if isAuthenticated() && isImageBelow5MB();
+    }
+    match /items/{allPaths=**} {
+      allow read: if isAuthenticated();
+      allow write: if isAuthenticated() && isImageBelow5MB();
+    }
+
+    // 3. User Avatars: Publicly visible, only owner can upload
+    match /profile_images/{userId}/{allPaths=**} {
+      allow read: if isAuthenticated();
+      allow write: if isAuthenticated() && request.auth.uid == userId && isImageBelow5MB();
+    }
+    match /profiles/{userId}/{allPaths=**} {
+      allow read: if isAuthenticated();
+      allow write: if isAuthenticated() && request.auth.uid == userId && isImageBelow5MB();
+    }
+
+    // 4. Handover Evidence Photos: Captured live at item handover
+    match /handover_evidence/{txnId}/{allPaths=**} {
+      allow read: if isAuthenticated();
+      allow write: if isAuthenticated() && isImageBelow5MB();
+    }
+
+    // 5. Return Evidence Photos: Captured live at item return
+    match /return_evidence/{txnId}/{allPaths=**} {
+      allow read: if isAuthenticated();
+      allow write: if isAuthenticated() && isImageBelow5MB();
+    }
+  }
+}

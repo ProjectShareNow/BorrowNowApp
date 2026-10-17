@@ -1,0 +1,265 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Helper functions
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function getUserData() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+
+    function isAdmin() {
+      return isAuthenticated() && 
+        (request.auth.token.email == 'admin@college.edu' || request.auth.token.email.matches('^admin@.*'));
+    }
+
+    // 1. Users collection
+    // ONLY administrators can verify students (approve or reject) or deactivate/reactivate.
+    // Regular students can register (with verificationStatus 'pending') and update basic profile info,
+    // but CANNOT modify their verificationStatus or rejectionReason.
+    match /users/{userId} {
+      allow read: if true;
+      allow create: if isAuthenticated() && (
+        (request.auth.uid == userId && 
+         request.resource.data.verificationStatus == 'pending') ||
+        isAdmin()
+      );
+      allow update: if isAdmin() || (
+        isAuthenticated() && request.auth.uid == userId &&
+        request.resource.data.verificationStatus == resource.data.verificationStatus &&
+        (!('rejectionReason' in request.resource.data) || request.resource.data.rejectionReason == resource.data.rejectionReason)
+      ) || (
+        isAuthenticated() &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['ratingAverage', 'ratingsCount', 'updatedAt'])
+      );
+      allow delete: if isAdmin();
+    }
+
+    // 2. Items collection
+    match /items/{itemId} {
+      // Campus discovery: any student or visitor can browse available items
+      allow read: if true;
+      // Authenticated students can list items
+      allow create: if isAuthenticated() && request.resource.data.ownerId == request.auth.uid;
+      allow update: if (isAuthenticated() && resource.data.ownerId == request.auth.uid) || isAdmin();
+      allow delete: if (isAuthenticated() && resource.data.ownerId == request.auth.uid) || isAdmin();
+    }
+
+    // 3. Borrow Requests collection
+    match /borrow_requests/{requestId} {
+      allow read: if isAuthenticated();
+      allow create: if isAuthenticated() && request.resource.data.borrowerId == request.auth.uid;
+      allow update: if isAuthenticated();
+      allow delete: if isAdmin();
+    }
+
+    // 4. Transactions collection
+    match /transactions/{txnId} {
+      allow read: if isAuthenticated();
+
+      // Create: only authenticated students creating a valid transaction for themselves
+      allow create: if isAuthenticated() && (
+        request.resource.data.ownerId == request.auth.uid ||
+        request.resource.data.borrowerId == request.auth.uid ||
+        isAdmin()
+      );
+
+      // Handover updates and return confirmations
+      allow update: if isAuthenticated() && (
+        isAdmin() ||
+        (
+          (resource.data.ownerId == request.auth.uid || resource.data.borrowerId == request.auth.uid) &&
+          // Borrower cannot self-verify handover identity
+          (!('handoverIdentityVerified' in request.resource.data) ||
+           request.resource.data.handoverIdentityVerified == resource.data.handoverIdentityVerified ||
+           (request.auth.uid == resource.data.ownerId && request.resource.data.handoverVerifiedBy == request.auth.uid)) &&
+          // Borrower cannot confirm handover on behalf of lender
+          (!('handoverConfirmed' in request.resource.data) ||
+           request.resource.data.handoverConfirmed == resource.data.handoverConfirmed ||
+           request.auth.uid == resource.data.ownerId) &&
+          // Only borrower can verify lender at return
+          (!('returnIdentityVerified' in request.resource.data) ||
+           request.resource.data.returnIdentityVerified == resource.data.returnIdentityVerified ||
+           (request.auth.uid == resource.data.borrowerId && request.resource.data.returnVerifiedBy == request.auth.uid)) &&
+          // Borrower cannot confirm lender return confirmation
+          (!('lenderReturnConfirmed' in request.resource.data) ||
+           request.resource.data.lenderReturnConfirmed == resource.data.lenderReturnConfirmed ||
+           request.auth.uid == resource.data.ownerId) &&
+          // Lender cannot confirm borrower return confirmation
+          (!('borrowerReturnConfirmed' in request.resource.data) ||
+           request.resource.data.borrowerReturnConfirmed == resource.data.borrowerReturnConfirmed ||
+           request.auth.uid == resource.data.borrowerId)
+        )
+      );
+    }
+
+    // 5. Chats and Messages
+    match /chats/{chatId} {
+      function isChatParticipant() {
+        return isAuthenticated() && resource != null && resource.data != null && (
+          (resource.data.participants != null && request.auth.uid in resource.data.participants) ||
+          resource.data.ownerId == request.auth.uid ||
+          resource.data.borrowerId == request.auth.uid ||
+          resource.data.lenderId == request.auth.uid ||
+          isAdmin()
+        );
+      }
+
+      function isChatParticipantForWrite() {
+        return isAuthenticated() && (
+          isAdmin() ||
+          (
+            (request.auth.uid == request.resource.data.borrowerId ||
+             request.auth.uid == request.resource.data.lenderId ||
+             request.auth.uid == request.resource.data.ownerId) &&
+            request.resource.data.participants != null &&
+            request.resource.data.participants.size() == 2 &&
+            request.resource.data.participants.hasAll([
+              request.resource.data.borrowerId,
+              request.resource.data.lenderId
+            ])
+          )
+        );
+      }
+
+      function parentChatExists() {
+        return exists(/databases/$(database)/documents/chats/$(chatId));
+      }
+
+      function getParentChatData() {
+        return get(/databases/$(database)/documents/chats/$(chatId)).data;
+      }
+
+      function isParentChatParticipant() {
+        return isAuthenticated() && parentChatExists() && (
+          (getParentChatData().participants != null &&
+           request.auth.uid in getParentChatData().participants) ||
+          getParentChatData().ownerId == request.auth.uid ||
+          getParentChatData().borrowerId == request.auth.uid ||
+          getParentChatData().lenderId == request.auth.uid ||
+          isAdmin()
+        );
+      }
+
+      function isParentChatActive() {
+        return parentChatExists() && (
+          !('status' in getParentChatData()) ||
+          getParentChatData().status == 'active'
+        );
+      }
+
+      function isValidMessage() {
+        return request.resource.data.senderId == request.auth.uid &&
+          (!('chatId' in request.resource.data) || request.resource.data.chatId == chatId) &&
+          (
+            ('text' in request.resource.data && request.resource.data.text is string && request.resource.data.text.size() > 0) ||
+            ('message' in request.resource.data && request.resource.data.message is string && request.resource.data.message.size() > 0)
+          ) &&
+          (
+            ('timestamp' in request.resource.data && request.resource.data.timestamp != null) ||
+            ('createdAt' in request.resource.data && request.resource.data.createdAt != null)
+          );
+      }
+
+      // Allow get only to verified participants or administrators
+      allow get: if isChatParticipant();
+      // List user chats only when query matches participants
+      allow list: if isAuthenticated() && (
+        (resource.data.participants != null && request.auth.uid in resource.data.participants) ||
+        resource.data.borrowerId == request.auth.uid ||
+        resource.data.lenderId == request.auth.uid ||
+        resource.data.ownerId == request.auth.uid ||
+        isAdmin()
+      );
+      // Participants can create new chat conversation with strictly 2 participants
+      allow create: if isChatParticipantForWrite();
+      // Participants can update chat metadata (last message, timestamps, unread counts) but cannot alter participants
+      allow update: if isAuthenticated() && (
+        isAdmin() ||
+        (
+          isChatParticipant() &&
+          request.resource.data.participants == resource.data.participants &&
+          request.resource.data.borrowerId == resource.data.borrowerId &&
+          request.resource.data.lenderId == resource.data.lenderId &&
+          request.resource.data.requestId == resource.data.requestId
+        )
+      );
+      allow delete: if isAdmin();
+
+      match /messages/{messageId} {
+        allow read: if isParentChatParticipant();
+        allow create: if isParentChatParticipant() &&
+          isParentChatActive() &&
+          isValidMessage();
+        allow update, delete: if isAdmin();
+      }
+    }
+
+
+    // 6. In-App Notifications
+    match /notifications/{notifId} {
+      allow read: if true;
+      allow create: if true;
+      allow update, delete: if isAuthenticated();
+    }
+
+    // 7. Ratings and Two-Way Feedback
+    match /ratings/{ratingId} {
+      // Authenticated students can view ratings & feedback
+      allow read: if isAuthenticated();
+
+      // Review submission:
+      // - Reviewer must be the authenticated user
+      // - Reviewer cannot rate themselves
+      // - Star rating must be strictly between 1 and 5
+      // - Role must be borrower or lender
+      allow create: if isAuthenticated() &&
+        (
+          request.resource.data.reviewerId == request.auth.uid ||
+          request.resource.data.fromUserId == request.auth.uid
+        ) &&
+        (
+          request.resource.data.revieweeId != request.auth.uid &&
+          request.resource.data.toUserId != request.auth.uid
+        ) &&
+        request.resource.data.rating >= 1 &&
+        request.resource.data.rating <= 5 &&
+        (
+          !('reviewerRole' in request.resource.data) ||
+          request.resource.data.reviewerRole in ['borrower', 'lender']
+        );
+
+      // Reviews are permanent and immutable (cannot be edited or deleted by users)
+      allow update, delete: if isAdmin();
+    }
+
+    // 8. Reports & Disputes
+    match /reports/{reportId} {
+      // Reporter or Admin can read
+      allow read: if isAuthenticated() && (resource.data.reporterId == request.auth.uid || isAdmin());
+      allow create: if isAuthenticated() && request.resource.data.reporterId == request.auth.uid;
+      allow update, delete: if isAdmin();
+    }
+
+    // 9. Device Tokens for Push Notifications
+    match /device_tokens/{tokenId} {
+      allow read, write: if true;
+    }
+
+    // 10. Announcements
+    match /announcements/{announcementId} {
+      allow read: if true;
+      allow create, update, delete: if isAdmin();
+    }
+
+    // 11. Admin Audit Logs
+    match /admin_audit_logs/{logId} {
+      allow read: if isAdmin();
+      allow create: if isAuthenticated();
+      allow update, delete: if false; // Immutable audit logs
+    }
+  }
+}

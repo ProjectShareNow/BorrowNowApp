@@ -1,0 +1,6 @@
+{
+  "debug.enableHoverEvaluation": false,
+  "debug.inlineValues": "off",
+  "dart.evaluateGettersInDebugViews": true,
+  "cmake.sourceDirectory": "E:/BorrowNow app/windows"
+}
